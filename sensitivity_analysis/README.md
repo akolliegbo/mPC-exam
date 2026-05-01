@@ -17,14 +17,12 @@ the full analysis pipeline. does not change between models — just swap in a co
 
 ---
 
-## what to ask each groupmate for
+## from each of y'all
 
-you need exactly four things. here's what to say:
+i need exactly four things. can you fill in these three functions in `model_template.py` and send it back?
 
-> "can you fill in these three functions in `model_template.py` and send it back?"
-
-### 1. `BASE_PARAMS` — their parameter names and baseline values
-a plain python dict. keys are whatever they named their parameters, values are the calibrated baseline estimates.
+### 1. `BASE_PARAMS`: parameter names and baseline values
+a plain python dict. keys are whatever y'all named parameters, values are the calibrated baseline estimates.
 
 ```python
 # pk/pd example
@@ -35,7 +33,7 @@ BASE_PARAMS = {
     'gamma': 0.30,   # PSA production scaling
 }
 
-# tumor burden example
+# for example
 BASE_PARAMS = {
     'r':     0.18,   # tumor growth rate (day^-1)
     'K':     500.0,  # carrying capacity (arbitrary units)
@@ -44,7 +42,7 @@ BASE_PARAMS = {
 }
 ```
 
-### 2. `ode(t, y, params, Tx)` — the right-hand side of their ODE
+### 2. `ode(t, y, params, Tx)`: the right-hand side of the ODE
 a function that takes the current state `y`, the params dict, and the treatment indicator `Tx` (1=on, 0=off), and returns `dy/dt` as a list. `t` is passed by scipy but usually unused.
 
 ```python
@@ -73,7 +71,7 @@ def ode(t, y, params, Tx):
 ```
 
 ### 3. state variable order + which index is the observable
-tell you: what is in `y[0]`, `y[1]`, etc., and which one is PSA (or equivalent observable). this determines the one line to change in `run_model()`:
+ what is in `y[0]`, `y[1]`, etc., and which one is PSA (or equivalent observable). this determines the one line to change in `run_model()`:
 
 ```python
 out.append(y[0])   # change 0 to whichever index is PSA in their state vector
@@ -100,8 +98,8 @@ def get_initial_conditions(params, output0):
 
 ## how to run
 
-1. get completed `model_template.py` files from each groupmate
-2. in `generalized_sensitivity.py`, replace the four sections at the top with their content (labeled "FILL IN 1/2/3")
+1. get completed `model_template.py` files for each model
+2. in `generalized_sensitivity.py`, replace the four sections at the top with the content (labeled "FILL IN 1/2/3")
 3. run `generalized_sensitivity.py` — all plots save automatically
 4. to compare all three models, uncomment and call `compare_models()` at the bottom with all three result dicts
 
