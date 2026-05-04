@@ -1,32 +1,40 @@
 """
-Per-patient fitting of PK/PD model to the 16-patient mCRPC adaptive therapy dataset.
+Per-patient fitting of PK/PD model to the 17-patient mCRPC adaptive therapy dataset.
 
-Strategy (Option 1):
-    - EC50 fixed at population level (15 ng/mL)
-    - Fitted per patient: S0, R0, alpha_max
-    - All PK parameters fixed at Stuyckens 2014 population means
-    - delta (PSA production rate) derived from initial PSA and initial cell
-      fractions so that simulated PSA(0) = observed PSA(0) exactly
+Model structure (Brady-Nicholls & Enderling 2020, Nature Communications):
+    State vector: [S, R, P]
+        S  : differentiated (drug-sensitive) PCa cells  — paper's 'D'
+        R  : stem-like (drug-resistant) PCa cells       — paper's 'S'
+        P  : serum PSA (ng/mL)
 
-PK approximation for fitting:
-    PSA observations are every 4-6 weeks; the PK half-life is 12 h.
-    Drug concentration reaches quasi-steady state (C_ss_avg) within ~3 days
-    of starting treatment and falls to ~0 within ~3 days of stopping.
-    For fitting, C is approximated as:
-        ON  : C = C_ss_avg = dose / (ke * V) * 1e3  [ng/mL]
-        OFF : C = 0
-    This collapses PK to a constant effective kill rate within each interval,
-    which is sufficient given monthly observation resolution.
+    ODEs:
+        dR/dt = (R/(R+S)) * p_s * λ * R
+        dS/dt = (1 - R/(R+S) * p_s) * λ * R  -  α(C) * S
+        dP/dt = δ * S  -  γ * P
 
-    C_ss_avg = 1000 mg / (1.386 day^-1 * 26840 L) * 1000 = 26.9 ng/mL
-    alpha_eff = alpha_max * C_ss / (EC50 + C_ss) = alpha_max * 0.643  (EC50=15)
+    where α(C) = alpha_max * C / (EC50 + C)   [Emax PD; our extension]
 
-Objective:
-    Sum of squared log-ratio errors: sum( (log PSA_sim - log PSA_obs)^2 )
-    Log scale is appropriate because PSA spans orders of magnitude.
+Fixed parameters:
+    λ   = ln(2)  day^-1   stem cell proliferation rate (one division/day)
+    EC50 = 15    ng/mL    half-maximal drug concentration
+    n_hill = 1             Hill coefficient
+
+Fitted per patient:
+    S0        initial differentiated cell fraction
+    R0        initial stem-like cell fraction
+    p_s       stem cell self-renewal probability
+    alpha_max maximum drug kill rate (day^-1)
+    gamma     PSA clearance rate (day^-1)
+
+delta is derived analytically so PSA(0) = observed PSA(0):
+    δ = psa0 * γ / S0
+
+PK approximation (QSS):
+    C = C_ss_avg ≈ 26.9 ng/mL when Abi=1, 0 when Abi=0.
+    C_ss_avg = dose / (ke * V) * 1e3
 
 Reference:
-    Brady-Nicholls & Enderling (2022); Stuyckens et al. (2014)
+    Brady-Nicholls & Enderling (2020) Nat Commun; Stuyckens et al. (2014)
 """
 
 import numpy as np
@@ -44,18 +52,16 @@ matplotlib.rcParams.update({'font.family': 'Arial', 'font.size': 12})
 # ── Fixed parameters ───────────────────────────────────────────────────────────
 
 P_BASE = {
-    'rho_S':   0.027,    # day^-1   sensitive cell proliferation (placeholder)
-    'rho_R':   0.003,    # day^-1   resistant cell proliferation (placeholder)
-    'K':       1.0,      # carrying capacity (normalized)
-    'gamma':   0.08,     # day^-1   PSA clearance
+    # Tumor dynamics — Brady-Nicholls 2020
+    'lambda_': np.log(2),  # day^-1   stem cell proliferation rate (1 division/day)
     # PK — Stuyckens et al. 2014, mCRPC population means, 1000 mg QD fasted
-    'ka':      39.6,     # day^-1   (not used in QSS fitting; retained for reference)
-    'ke':      1.386,    # day^-1   elimination rate constant (from t½ = 12 h)
-    'V':       26840.0,  # L        apparent V/F
-    'dose_mg': 1000.0,   # mg       abiraterone acetate QD fasted
-    # PD — EC50 fixed; alpha_max fitted per patient
-    'EC50':    15.0,     # ng/mL    fixed (~0.5 * C_ss_avg)
-    'n_hill':  1.0,      # Hill coefficient (fixed)
+    'ka':      39.6,       # day^-1   (not used in QSS fitting; retained for reference)
+    'ke':      1.386,      # day^-1   elimination rate constant (from t½ = 12 h)
+    'V':       26840.0,    # L        apparent V/F
+    'dose_mg': 1000.0,     # mg       abiraterone acetate QD fasted
+    # PD — Emax model; EC50 fixed, alpha_max fitted per patient
+    'EC50':    15.0,       # ng/mL    fixed (~0.5 * C_ss_avg)
+    'n_hill':  1.0,        # Hill coefficient (fixed)
 }
 
 # Quasi-steady-state concentration (derived from PK parameters)
@@ -104,6 +110,15 @@ def load_adaptive_patients(filepath):
 
 def odes(t, y, p, C, delta):
     """
+    Brady-Nicholls 2020 stem cell model with Emax PD extension.
+
+    S = differentiated (sensitive) cells  [paper's D]
+    R = stem-like (resistant) cells       [paper's S]
+
+    dR/dt = (R/(R+S)) * p_s * λ * R
+    dS/dt = (1 - R/(R+S) * p_s) * λ * R  -  α(C) * S
+    dP/dt = δ * S  -  γ * P
+
     Parameters
     ----------
     C     : float  drug concentration during this interval (ng/mL)
@@ -115,10 +130,12 @@ def odes(t, y, p, C, delta):
     alpha = (p['alpha_max'] * C_pos**p['n_hill']
              / (p['EC50']**p['n_hill'] + C_pos**p['n_hill']))
 
-    N  = S + R
-    dS = p['rho_S'] * S * (1 - N / p['K']) - alpha * S
-    dR = p['rho_R'] * R * (1 - N / p['K'])
-    dP = delta * (S + R) - p['gamma'] * P
+    N = S + R
+    stem_frac = R / N if N > 1e-12 else 0.0
+
+    dR = stem_frac * p['p_s'] * p['lambda_'] * R
+    dS = (1.0 - stem_frac * p['p_s']) * p['lambda_'] * R - alpha * S
+    dP = delta * S - p['gamma'] * P
 
     return [dS, dR, dP]
 
@@ -139,8 +156,8 @@ def simulate_patient(p, days_obs, abi_obs, S0, R0, alpha_max, psa0):
     p = p.copy()
     p['alpha_max'] = alpha_max
 
-    # Derive delta so PSA(0) = psa0 at quasi-steady state
-    delta = psa0 * p['gamma'] / (S0 + R0)
+    # Derive delta so PSA(0) = psa0 exactly (only S produces PSA)
+    delta = psa0 * p['gamma'] / S0
 
     y = np.array([S0, R0, psa0])
     psa_sim = [psa0]
@@ -168,12 +185,13 @@ def simulate_patient(p, days_obs, abi_obs, S0, R0, alpha_max, psa0):
 # ── Objective function ─────────────────────────────────────────────────────────
 
 def objective(params, days_obs, psa_obs, abi_obs, p_base):
-    S0, R0, alpha_max, gamma = params
+    S0, R0, p_s, alpha_max, gamma = params
 
-    if S0 + R0 >= p_base['K'] or S0 <= 0 or R0 <= 0 or alpha_max <= 0 or gamma <= 0:
+    if S0 <= 0 or R0 <= 0 or p_s <= 0 or p_s >= 1 or alpha_max <= 0 or gamma <= 0:
         return 1e6
 
     p = p_base.copy()
+    p['p_s']   = p_s
     p['gamma'] = gamma
 
     try:
@@ -190,7 +208,7 @@ def objective(params, days_obs, psa_obs, abi_obs, p_base):
 
 def fit_patient(pid, data, p_base):
     """
-    Fit S0, R0, alpha_max for one patient using differential evolution.
+    Fit S0, R0, p_s, alpha_max, gamma for one patient using differential evolution.
 
     Returns
     -------
@@ -200,17 +218,15 @@ def fit_patient(pid, data, p_base):
     psa_obs  = data['psa']
     abi_obs  = data['abi']
 
-    # gamma (PSA clearance) is also fitted per patient.
-    # With gamma fixed at 0.08 day^-1 (t½ ≈ 8.7 days), PSA cannot physically
-    # drop as fast as observed in some patients (e.g. 6.06 → 0.03 ng/mL in
-    # 27 days). Brady et al. fit their equivalent parameter (phi) at the
-    # population level from 70 patients, giving a different value.
-    # Bounds: gamma ∈ [0.05, 1.0] day^-1 (t½ between 16.6 h and 14 days).
+    # p_s ∈ (0, 0.5): self-renewal probability; >0.5 would expand the stem pool
+    # unboundedly. Brady-Nicholls median p_s = 0.0278.
+    # gamma ∈ [0.05, 1.0] day^-1: PSA clearance. Brady-Nicholls phi = 0.0856.
     bounds = [
-        (0.01, 0.94),   # S0
-        (0.001, 0.48),  # R0        (S0 + R0 < 1 enforced in objective)
-        (0.001, 0.50),  # alpha_max
-        (0.05,  1.00),  # gamma     PSA clearance rate (day^-1)
+        (0.01,  0.99),   # S0        initial differentiated fraction
+        (0.001, 0.50),   # R0        initial stem-like fraction
+        (0.001, 0.499),  # p_s       stem self-renewal probability
+        (0.001, 0.50),   # alpha_max max drug kill rate (day^-1)
+        (0.05,  1.00),   # gamma     PSA clearance rate (day^-1)
     ]
 
     result = differential_evolution(
@@ -227,8 +243,9 @@ def fit_patient(pid, data, p_base):
         workers=1,
     )
 
-    S0, R0, alpha_max, gamma = result.x
+    S0, R0, p_s, alpha_max, gamma = result.x
     p_fit = p_base.copy()
+    p_fit['p_s']   = p_s
     p_fit['gamma'] = gamma
     psa_sim = simulate_patient(
         p_fit, days_obs, abi_obs, S0, R0, alpha_max, psa_obs[0]
@@ -238,6 +255,7 @@ def fit_patient(pid, data, p_base):
         'pid':       pid,
         'S0':        S0,
         'R0':        R0,
+        'p_s':       p_s,
         'alpha_max': alpha_max,
         'gamma':     gamma,
         'days':      days_obs,
@@ -271,7 +289,7 @@ def plot_fits(fits, ncols=4):
                     label='Fitted')
         ax.set_title(f"{fit['pid']}\n"
                      f"S0={fit['S0']:.2f}, R0={fit['R0']:.3f}, "
-                     f"α_max={fit['alpha_max']:.3f}",
+                     f"p_s={fit['p_s']:.4f}, α_max={fit['alpha_max']:.3f}",
                      fontsize=9)
         ax.set_xlabel('Time (years)', fontsize=8)
         ax.set_ylabel('PSA (ng/mL)', fontsize=8)
@@ -282,21 +300,23 @@ def plot_fits(fits, ncols=4):
 
     axes[0].legend(frameon=False, fontsize=8)
     plt.suptitle('Per-patient PK/PD fits — adaptive therapy arm\n'
-                 f'Fixed: EC50={P_BASE["EC50"]} ng/mL, C_ss={C_SS:.1f} ng/mL',
+                 f'Fixed: λ=ln(2), EC50={P_BASE["EC50"]} ng/mL, '
+                 f'C_ss={C_SS:.1f} ng/mL',
                  fontsize=12, y=1.01)
     plt.tight_layout()
     return fig
 
 
 def print_summary(fits):
-    print(f"\n{'Patient':<10} {'S0':>6} {'R0':>7} {'alpha_max':>10} "
-          f"{'alpha_eff':>10} {'SSE_log':>8}")
-    print('-' * 58)
     alpha_eff_factor = C_SS / (P_BASE['EC50'] + C_SS)
+    print(f"\n{'Patient':<10} {'S0':>6} {'R0':>7} {'p_s':>8} "
+          f"{'alpha_max':>10} {'alpha_eff':>10} {'gamma':>7} {'SSE_log':>8}")
+    print('-' * 75)
     for f in fits:
         alpha_eff = f['alpha_max'] * alpha_eff_factor
         print(f"{f['pid']:<10} {f['S0']:>6.3f} {f['R0']:>7.4f} "
-              f"{f['alpha_max']:>10.4f} {alpha_eff:>10.4f} {f['fun']:>8.3f}")
+              f"{f['p_s']:>8.4f} {f['alpha_max']:>10.4f} "
+              f"{alpha_eff:>10.4f} {f['gamma']:>7.4f} {f['fun']:>8.3f}")
     print(f"\nC_ss_avg = {C_SS:.1f} ng/mL  |  "
           f"alpha_eff = alpha_max x {alpha_eff_factor:.3f}  (EC50={P_BASE['EC50']} ng/mL)")
 
@@ -316,7 +336,7 @@ if __name__ == '__main__':
         print(f"[{i+1:2d}/{len(patients)}] Fitting {pid}...", end=' ', flush=True)
         fit = fit_patient(pid, data, P_BASE)
         fits.append(fit)
-        print(f"S0={fit['S0']:.3f}, R0={fit['R0']:.4f}, "
+        print(f"S0={fit['S0']:.3f}, R0={fit['R0']:.4f}, p_s={fit['p_s']:.4f}, "
               f"alpha_max={fit['alpha_max']:.4f}, SSE={fit['fun']:.3f}")
 
     print_summary(fits)

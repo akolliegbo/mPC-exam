@@ -30,15 +30,13 @@ matplotlib.rcParams.update({'font.family': 'Arial', 'font.size': 14})
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 p = {
-    # --- Tumor dynamics (Brady-Nicholls & Enderling 2022 Table 1 typical values) ---
-    'rho_S':    0.027,   # day^-1   sensitive cell net proliferation rate
-    'rho_R':    0.003,   # day^-1   resistant cell net proliferation rate
-                         #          must be << rho_S for competitive suppression to hold across cycles
-                         #          placeholder — will be fit per-patient from the 16-patient dataset
-    'K':        1.0,     # carrying capacity (cells normalized; S+R in [0,1])
-    'delta_S':  1.0,     # PSA production rate per unit sensitive cell mass
-    'delta_R':  1.0,     # PSA production rate per unit resistant cell mass
-    'gamma':    0.08,    # day^-1   PSA clearance rate
+    # --- Tumor dynamics — Brady-Nicholls & Enderling (2020) stem cell model ---
+    # S in code = differentiated (drug-sensitive) cells  [paper's 'D']
+    # R in code = stem-like (drug-resistant) cells       [paper's 'S']
+    'lambda_':  np.log(2), # day^-1   stem cell proliferation rate (1 division/day)
+    'p_s':      0.0278,    # stem self-renewal probability (paper median, training cohort)
+    'delta':    1.0,       # PSA production rate per unit differentiated cell mass
+    'gamma':    0.0856,    # day^-1   PSA clearance rate (paper phi, population uniform)
 
     # --- PK: 1-compartment with first-order absorption ---
     # Population-mean values from Stuyckens et al. 2014 (Clin Pharmacokinet),
@@ -104,13 +102,17 @@ def odes(t, y, p):
     alpha = (p['alpha_max'] * C_pos**p['n_hill']
              / (p['EC50']**p['n_hill'] + C_pos**p['n_hill']))
 
-    # Tumor (logistic growth + drug kill on sensitive cells only)
+    # Tumor — Brady-Nicholls 2020 stem cell model
+    # S = differentiated (sensitive) cells [paper's D]
+    # R = stem-like (resistant) cells      [paper's S]
     N = S + R
-    dS = p['rho_S'] * S * (1 - N / p['K']) - alpha * S
-    dR = p['rho_R'] * R * (1 - N / p['K'])
+    stem_frac = R / N if N > 1e-12 else 0.0
 
-    # PSA (produced by both populations, cleared at rate gamma)
-    dP = p['delta_S'] * S + p['delta_R'] * R - p['gamma'] * P
+    dR = stem_frac * p['p_s'] * p['lambda_'] * R
+    dS = (1.0 - stem_frac * p['p_s']) * p['lambda_'] * R - alpha * S
+
+    # PSA (produced by differentiated cells only, cleared at rate gamma)
+    dP = p['delta'] * S - p['gamma'] * P
 
     return [dD, dC, dS, dR, dP]
 
@@ -133,8 +135,8 @@ def simulate(p, t_end=1825.0, S0=0.45, R0=0.05):
     Y      : (5, n) state array rows = [D, C, S, R, P]
     treat  : list of (t_on, t_off) treatment intervals
     """
-    # Initial PSA at approximate quasi-steady state
-    P0 = (p['delta_S'] * S0 + p['delta_R'] * R0) / p['gamma']
+    # Initial PSA at approximate quasi-steady state (only S produces PSA)
+    P0 = p['delta'] * S0 / p['gamma']
 
     PSA_thresh_on  = p['frac_on']  * P0
     PSA_thresh_off = p['frac_off'] * P0
