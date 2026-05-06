@@ -15,16 +15,16 @@ Model structure (Brady-Nicholls & Enderling 2020, Nature Communications):
     where α(C) = alpha_max * C / (EC50 + C)   [Emax PD; our extension]
 
 Fixed parameters:
-    λ   = ln(2)  day^-1   stem cell proliferation rate (one division/day)
-    EC50 = 15    ng/mL    half-maximal drug concentration
-    n_hill = 1             Hill coefficient
+    λ      = ln(2)   day^-1   stem cell proliferation rate (one division/day)
+    p_s    = 0.0278           stem self-renewal probability (Brady-Nicholls 2020 median)
+    EC50   = 15      ng/mL    half-maximal drug concentration
+    n_hill = 1                Hill coefficient
 
 Fitted per patient:
     S0        initial differentiated cell fraction
     R0        initial stem-like cell fraction
-    p_s       stem cell self-renewal probability
     alpha_max maximum drug kill rate (day^-1)
-    gamma     PSA clearance rate (day^-1)
+    gamma     PSA clearance rate (day^-1); Brady-Nicholls population mean = 0.0856
 
 delta is derived analytically so PSA(0) = observed PSA(0):
     δ = psa0 * γ / S0
@@ -41,6 +41,8 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import differential_evolution
 import openpyxl
+import pickle
+import argparse
 import matplotlib.pyplot as plt
 import matplotlib
 import warnings
@@ -54,6 +56,8 @@ matplotlib.rcParams.update({'font.family': 'Arial', 'font.size': 12})
 P_BASE = {
     # Tumor dynamics — Brady-Nicholls 2020
     'lambda_': np.log(2),  # day^-1   stem cell proliferation rate (1 division/day)
+    'p_s':     0.0278,     # stem self-renewal probability (Brady-Nicholls 2020 reported median; fixed)
+    'gamma':   0.0856,     # day^-1   PSA clearance rate (Brady-Nicholls 2020 population-uniform phi; prior only)
     # PK — Stuyckens et al. 2014, mCRPC population means, 1000 mg QD fasted
     'ka':      39.6,       # day^-1   (not used in QSS fitting; retained for reference)
     'ke':      1.386,      # day^-1   elimination rate constant (from t½ = 12 h)
@@ -62,6 +66,7 @@ P_BASE = {
     # PD — Emax model; EC50 fixed, alpha_max fitted per patient
     'EC50':    15.0,       # ng/mL    fixed (~0.5 * C_ss_avg)
     'n_hill':  1.0,        # Hill coefficient (fixed)
+    'interval': 1.0,       # days     dosing interval for full PK simulation (QD)
 }
 
 # Quasi-steady-state concentration (derived from PK parameters)
@@ -185,13 +190,12 @@ def simulate_patient(p, days_obs, abi_obs, S0, R0, alpha_max, psa0):
 # ── Objective function ─────────────────────────────────────────────────────────
 
 def objective(params, days_obs, psa_obs, abi_obs, p_base):
-    S0, R0, p_s, alpha_max, gamma = params
+    S0, R0, alpha_max, gamma = params
 
-    if S0 <= 0 or R0 <= 0 or p_s <= 0 or p_s >= 1 or alpha_max <= 0 or gamma <= 0:
+    if S0 <= 0 or R0 <= 0 or alpha_max <= 0 or gamma <= 0:
         return 1e6
 
     p = p_base.copy()
-    p['p_s']   = p_s
     p['gamma'] = gamma
 
     try:
@@ -218,15 +222,11 @@ def fit_patient(pid, data, p_base):
     psa_obs  = data['psa']
     abi_obs  = data['abi']
 
-    # p_s ∈ (0, 0.5): self-renewal probability; >0.5 would expand the stem pool
-    # unboundedly. Brady-Nicholls median p_s = 0.0278.
-    # gamma ∈ [0.05, 1.0] day^-1: PSA clearance. Brady-Nicholls phi = 0.0856.
     bounds = [
         (0.01,  0.99),   # S0        initial differentiated fraction
         (0.001, 0.50),   # R0        initial stem-like fraction
-        (0.001, 0.499),  # p_s       stem self-renewal probability
-        (0.001, 0.50),   # alpha_max max drug kill rate (day^-1)
-        (0.05,  1.00),   # gamma     PSA clearance rate (day^-1)
+        (0.001, 1.00),   # alpha_max max drug kill rate (day^-1)
+        (0.05,  1.00),   # gamma     PSA clearance rate (day^-1); Brady-Nicholls mean = 0.0856
     ]
 
     result = differential_evolution(
@@ -243,9 +243,8 @@ def fit_patient(pid, data, p_base):
         workers=1,
     )
 
-    S0, R0, p_s, alpha_max, gamma = result.x
+    S0, R0, alpha_max, gamma = result.x
     p_fit = p_base.copy()
-    p_fit['p_s']   = p_s
     p_fit['gamma'] = gamma
     psa_sim = simulate_patient(
         p_fit, days_obs, abi_obs, S0, R0, alpha_max, psa_obs[0]
@@ -255,7 +254,6 @@ def fit_patient(pid, data, p_base):
         'pid':       pid,
         'S0':        S0,
         'R0':        R0,
-        'p_s':       p_s,
         'alpha_max': alpha_max,
         'gamma':     gamma,
         'days':      days_obs,
@@ -289,7 +287,7 @@ def plot_fits(fits, ncols=4):
                     label='Fitted')
         ax.set_title(f"{fit['pid']}\n"
                      f"S0={fit['S0']:.2f}, R0={fit['R0']:.3f}, "
-                     f"p_s={fit['p_s']:.4f}, α_max={fit['alpha_max']:.3f}",
+                     f"α_max={fit['alpha_max']:.3f}",
                      fontsize=9)
         ax.set_xlabel('Time (years)', fontsize=8)
         ax.set_ylabel('PSA (ng/mL)', fontsize=8)
@@ -307,44 +305,139 @@ def plot_fits(fits, ncols=4):
     return fig
 
 
+def plot_obs_vs_pred(fits):
+    """
+    Observed vs predicted PSA on log-log scale, colored by patient.
+    Points on the diagonal = perfect fit.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    cmap = plt.get_cmap('tab20', len(fits))
+    all_vals = []
+
+    for i, fit in enumerate(fits):
+        obs = fit['psa_obs']
+        sim = np.maximum(fit['psa_sim'], 1e-6)
+        ax.scatter(obs, sim, color=cmap(i), s=20, alpha=0.75,
+                   label=fit['pid'], zorder=3)
+        all_vals.extend(list(obs) + list(sim))
+
+    # Identity line
+    vmin = max(min(all_vals) * 0.8, 1e-3)
+    vmax = max(all_vals) * 1.2
+    ax.plot([vmin, vmax], [vmin, vmax], 'k--', lw=1, zorder=2)
+
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlim(vmin, vmax)
+    ax.set_ylim(vmin, vmax)
+    ax.set_xlabel('Observed PSA (ng/mL)')
+    ax.set_ylabel('Predicted PSA (ng/mL)')
+    ax.set_title('Observed vs predicted PSA\n(log scale; dashed = perfect fit)')
+    ax.legend(frameon=False, fontsize=7, ncol=2,
+              loc='upper left', bbox_to_anchor=(1.01, 1))
+    ax.spines[['top', 'right']].set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
+def plot_sse_bar(fits):
+    """
+    Bar chart of log-scale SSE per patient, sorted descending.
+    """
+    fits_sorted = sorted(fits, key=lambda f: f['fun'], reverse=True)
+    pids = [f['pid'] for f in fits_sorted]
+    sses = [f['fun'] for f in fits_sorted]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bars = ax.bar(pids, sses, color='steelblue', edgecolor='white', linewidth=0.5)
+    ax.set_ylabel('Log-scale SSE')
+    ax.set_xlabel('Patient')
+    ax.set_title('Goodness of fit per patient\n'
+                 r'SSE = $\Sigma(\log\,PSA_{sim} - \log\,PSA_{obs})^2$')
+    ax.spines[['top', 'right']].set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
 def print_summary(fits):
     alpha_eff_factor = C_SS / (P_BASE['EC50'] + C_SS)
-    print(f"\n{'Patient':<10} {'S0':>6} {'R0':>7} {'p_s':>8} "
+    print(f"\n{'Patient':<10} {'S0':>6} {'R0':>7} "
           f"{'alpha_max':>10} {'alpha_eff':>10} {'gamma':>7} {'SSE_log':>8}")
-    print('-' * 75)
+    print('-' * 65)
     for f in fits:
         alpha_eff = f['alpha_max'] * alpha_eff_factor
         print(f"{f['pid']:<10} {f['S0']:>6.3f} {f['R0']:>7.4f} "
-              f"{f['p_s']:>8.4f} {f['alpha_max']:>10.4f} "
-              f"{alpha_eff:>10.4f} {f['gamma']:>7.4f} {f['fun']:>8.3f}")
+              f"{f['alpha_max']:>10.4f} {alpha_eff:>10.4f} "
+              f"{f['gamma']:>7.4f} {f['fun']:>8.3f}")
     print(f"\nC_ss_avg = {C_SS:.1f} ng/mL  |  "
           f"alpha_eff = alpha_max x {alpha_eff_factor:.3f}  (EC50={P_BASE['EC50']} ng/mL)")
 
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 
+def save_fits(fits, path):
+    with open(path, 'wb') as f:
+        pickle.dump(fits, f)
+
+
+def load_fits(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def save_figures(fits, base):
+    fig = plot_fits(fits)
+    fig.savefig(base + 'patient_fits.pdf', dpi=300, bbox_inches='tight')
+    print("Figure saved to patient_fits.pdf")
+
+    fig2 = plot_obs_vs_pred(fits)
+    fig2.savefig(base + 'obs_vs_pred.pdf', dpi=300, bbox_inches='tight')
+    print("Figure saved to obs_vs_pred.pdf")
+
+    fig3 = plot_sse_bar(fits)
+    fig3.savefig(base + 'sse_per_patient.pdf', dpi=300, bbox_inches='tight')
+    print("Figure saved to sse_per_patient.pdf")
+
+    plt.show()
+
+
 if __name__ == '__main__':
-    DATA_PATH = ('/Users/80031987/Desktop/Basanta_Marusyk_Lab_2026/'
-                 'PKPD_AdaptiveTherapy/TrialPatientData.xlsx')
+    BASE      = ('/Users/80031987/Desktop/Basanta_Marusyk_Lab_2026/'
+                 'PKPD_AdaptiveTherapy/')
+    DATA_PATH = BASE + 'TrialPatientData.xlsx'
+    FITS_PATH = BASE + 'fits.pkl'
 
-    print("Loading patient data...")
-    patients = load_adaptive_patients(DATA_PATH)
-    print(f"  {len(patients)} patients: {list(patients.keys())}\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--plot-only', action='store_true',
+                        help='Load saved fits and regenerate figures without refitting')
+    args = parser.parse_args()
 
-    fits = []
-    for i, (pid, data) in enumerate(patients.items()):
-        print(f"[{i+1:2d}/{len(patients)}] Fitting {pid}...", end=' ', flush=True)
-        fit = fit_patient(pid, data, P_BASE)
-        fits.append(fit)
-        print(f"S0={fit['S0']:.3f}, R0={fit['R0']:.4f}, p_s={fit['p_s']:.4f}, "
-              f"alpha_max={fit['alpha_max']:.4f}, SSE={fit['fun']:.3f}")
+    if args.plot_only:
+        print(f"Loading saved fits from {FITS_PATH}...")
+        fits = load_fits(FITS_PATH)
+        print(f"  {len(fits)} patients loaded\n")
+    else:
+        print("Loading patient data...")
+        patients = load_adaptive_patients(DATA_PATH)
+        print(f"  {len(patients)} patients: {list(patients.keys())}\n")
+
+        INCLUDE = {'P1001', 'P1002', 'P1003', 'P1004', 'P1006',
+                   'P1009', 'P1011', 'P1012', 'P1015', 'P1016'}
+        patients = {pid: data for pid, data in patients.items() if pid in INCLUDE}
+        print(f"  Filtered to {len(patients)} patients: {list(patients.keys())}\n")
+
+        fits = []
+        for i, (pid, data) in enumerate(patients.items()):
+            print(f"[{i+1:2d}/{len(patients)}] Fitting {pid}...", end=' ', flush=True)
+            fit = fit_patient(pid, data, P_BASE)
+            fits.append(fit)
+            print(f"S0={fit['S0']:.3f}, R0={fit['R0']:.4f}, "
+                  f"alpha_max={fit['alpha_max']:.4f}, gamma={fit['gamma']:.4f}, "
+                  f"SSE={fit['fun']:.3f}")
+
+        save_fits(fits, FITS_PATH)
+        print(f"\nFits saved to fits.pkl")
 
     print_summary(fits)
-
-    fig = plot_fits(fits)
-    plt.tight_layout()
-    plt.savefig('/Users/80031987/Desktop/Basanta_Marusyk_Lab_2026/'
-                'PKPD_AdaptiveTherapy/patient_fits.pdf',
-                dpi=300, bbox_inches='tight')
-    print("\nFigure saved to patient_fits.pdf")
-    plt.show()
+    save_figures(fits, BASE)

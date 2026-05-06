@@ -1,251 +1,377 @@
 """
-PK/PD extension of Brady-Nicholls & Enderling (2022) adaptive therapy model for mCRPC.
+PK/PD adaptive therapy simulation using per-patient fitted parameters.
 
-Original model: binary treatment switch driving cell kill rate alpha.
-Extension: 1-compartment PK (depot -> central) + Emax PD: alpha(C) = alpha_max * C^n / (EC50^n + C^n)
+Model structure (Brady-Nicholls & Enderling 2020 + Emax PD extension):
+    State vector: [S, R, P]
+        S  : differentiated (sensitive) cells  — paper's 'D'
+        R  : stem-like (resistant) cells       — paper's 'S'
+        P  : serum PSA (ng/mL)
 
-State vector: [D, C, S, R, P]
-    D  : drug amount in depot       (mg)
-    C  : drug concentration, central (ng/mL)
-    S  : sensitive cell fraction     (normalized to K)
-    R  : resistant cell fraction     (normalized to K)
-    P  : PSA                         (ng/mL)
+    ODEs (QSS PK approximation):
+        dR/dt = (R/(R+S)) * p_s * λ * R
+        dS/dt = (1 - R/(R+S) * p_s) * λ * R  -  α(C) * S
+        dP/dt = δ * S  -  γ * P
 
-Units note:
-    Dose added to D in mg. Conversion to C:
-        dC/dt = ka * (D/V_L) * unit_factor - ke * C
-    With V in L and D in mg: D/V is mg/L = ug/mL = 1000 ng/mL.
-    Set unit_factor = 1000 to get C in ng/mL, or work in ug/mL by adjusting EC50.
-    Here we keep everything in consistent scaled units (see params below).
+    α(C) = alpha_max * C / (EC50 + C)   [Emax PD]
+    C    = C_SS when treating, 0 otherwise   [QSS PK]
+
+RBAT switching protocol (Brady-Nicholls 2022 Cancers):
+    p1   : PSA at start of last observed treatment cycle (per patient)
+    β    = (1 + x) * p1    — acceptable baseline (treatment OFF trigger)
+    τ    = (1 + y) * β     — treatment ON trigger
+    x ∈ {0.10, 0.25, 0.50},  y ∈ {0.10, 0.50, 1.00}
+
+References:
+    Brady-Nicholls & Enderling (2020) Nat Commun
+    Brady-Nicholls et al. (2022) Cancers
+    Stuyckens et al. (2014)
 """
 
+import sys
+import os
+import itertools
 import numpy as np
 from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import matplotlib
+import warnings
+warnings.filterwarnings('ignore')
 
-matplotlib.rcParams.update({'font.family': 'Arial', 'font.size': 14})
+matplotlib.rcParams.update({'font.family': 'Arial', 'font.size': 12})
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fit_patients import load_adaptive_patients, P_BASE, C_SS
 
-# ── Parameters ────────────────────────────────────────────────────────────────
+DATA_PATH = ('/Users/80031987/Desktop/Basanta_Marusyk_Lab_2026/'
+             'PKPD_AdaptiveTherapy/TrialPatientData.xlsx')
 
-p = {
-    # --- Tumor dynamics — Brady-Nicholls & Enderling (2020) stem cell model ---
-    # S in code = differentiated (drug-sensitive) cells  [paper's 'D']
-    # R in code = stem-like (drug-resistant) cells       [paper's 'S']
-    'lambda_':  np.log(2), # day^-1   stem cell proliferation rate (1 division/day)
-    'p_s':      0.0278,    # stem self-renewal probability (paper median, training cohort)
-    'delta':    1.0,       # PSA production rate per unit differentiated cell mass
-    'gamma':    0.0856,    # day^-1   PSA clearance rate (paper phi, population uniform)
-
-    # --- PK: 1-compartment with first-order absorption ---
-    # Population-mean values from Stuyckens et al. 2014 (Clin Pharmacokinet),
-    # mCRPC patient subgroup, 1000 mg QD fasted + prednisone 5 mg BID.
-    # Stuyckens used a 2-compartment Erlang transit model; values below are
-    # adapted for a 1-compartment first-order approximation:
-    #
-    #   ka  : Stuyckens Erlang absorption rate = 1.65 h^-1 = 39.6 day^-1.
-    #         Used directly as first-order ka (conservative simplification).
-    #   ke  : Derived from terminal t½ ≈ 12 h (clinical label) rather than
-    #         CL/V_central (which gives the faster distribution-phase t½ of
-    #         ~2.5 h and is inappropriate for a 1-compartment model).
-    #         ke = ln(2) / 0.5 day = 1.386 day^-1.
-    #   V   : Apparent V/F = (CL/F) / ke = 37200 L/day / 1.386 day^-1
-    #         = 26840 L.  Works with apparent CL/F throughout (F not needed
-    #         separately because dose enters depot and F is implicit in CL/F).
-    #
-    # Resulting steady-state average concentration:
-    #   C_ss_avg = dose / (CL/F * tau) * 1e3
-    #            = 1000 mg / (37200 L/day * 1 day) * 1000 ng/mL per mg/L
-    #            ≈ 27 ng/mL   (consistent with reported fasted AUC ~645 ng·h/mL)
-    #
-    # Units: D in mg, C in ng/mL, V in L
-    # dC/dt = ka * (D/V) * 1e3 - ke * C   [1 mg/L = 1000 ng/mL]
-    'ka':       39.6,    # day^-1   absorption rate constant (Stuyckens 2014)
-    'ke':       1.386,   # day^-1   elimination rate constant, from t½ = 12 h
-    'V':        26840.0, # L        apparent V/F = (CL/F)/ke (Stuyckens 2014)
-
-    # --- PD: Emax (Hill) model ---
-    # C_ss_avg ≈ 27 ng/mL with abiraterone population-mean PK above.
-    # EC50 must be on the same scale for meaningful drug effect.
-    # No published EC50 for abiraterone cell-kill is available; placeholder
-    # set to ~0.5 * C_ss so the drug operates near half-maximal effect at
-    # steady state. Requires calibration to tumour response data.
-    'alpha_max': 0.040,  # day^-1   maximum drug-induced kill rate (placeholder)
-    'EC50':      15.0,   # ng/mL    placeholder: ~0.5 * C_ss_avg ≈ 27/2 ng/mL
-    'n_hill':    1.0,    # Hill coefficient (n=1: hyperbolic; n>1: sigmoidal)
-
-    # --- Dosing ---
-    'dose_mg':   1000.0, # mg       abiraterone acetate, standard SOC dose
-    'interval':  1.0,    # days     QD (once daily)
-
-    # --- Adaptive therapy PSA thresholds ---
-    # Treatment ON  when PSA >= frac_on  * PSA_0
-    # Treatment OFF when PSA <= frac_off * PSA_0
-    'frac_on':   1.0,    # start treatment when PSA returns to baseline
-    'frac_off':  0.5,    # stop treatment when PSA halved from baseline
-}
+# RBAT threshold grid (Brady-Nicholls 2022 Cancers)
+X_VALS = [0.10, 0.25, 0.50]   # acceptable baseline: β = (1+x)*p1
+Y_VALS = [0.10, 0.50, 1.00]   # treatment trigger:   τ = (1+y)*β
 
 
-# ── ODE system ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def odes(t, y, p):
-    D, C, S, R, P = y
+def get_last_cycle_psa(data):
+    """
+    Return p1: PSA at the start of the last COMPLETE treatment cycle.
 
-    # PK
-    dD = -p['ka'] * D
-    # Unit conversion: D in mg, V in L -> D/V in mg/L = 1000 ng/mL
-    dC = p['ka'] * (D / p['V']) * 1e3 - p['ke'] * C
+    A complete cycle has both an ON transition (0→1) and a subsequent
+    OFF transition (1→0). If the final ON period is still ongoing at the
+    end of observation (no subsequent OFF), we use the preceding complete
+    cycle instead — matching the Brady-Nicholls 2022 Cancers approach.
+    Falls back to psa[0] if no complete cycle is found.
+    """
+    abi, psa = data['abi'], data['psa']
 
-    # PD: Emax kill rate from current concentration
-    C_pos = max(C, 0.0)   # guard against tiny negative values from integrator
+    # Collect indices of all 0→1 (ON) and 1→0 (OFF) transitions
+    on_idxs  = [i for i in range(1, len(abi)) if abi[i] == 1 and abi[i-1] == 0]
+    off_idxs = [i for i in range(1, len(abi)) if abi[i] == 0 and abi[i-1] == 1]
+
+    # Also include idx 0 if treatment starts on day 0
+    if len(abi) > 0 and abi[0] == 1:
+        on_idxs = [0] + on_idxs
+
+    # Find the last ON index that has a subsequent OFF (complete cycle)
+    last_complete_on = None
+    for on_idx in reversed(on_idxs):
+        if any(off_idx > on_idx for off_idx in off_idxs):
+            last_complete_on = on_idx
+            break
+
+    if last_complete_on is not None:
+        return float(psa[last_complete_on])
+    elif on_idxs:
+        return float(psa[on_idxs[-1]])   # fallback: last ON start
+    else:
+        return float(psa[0])
+
+
+# ── ODE system (QSS: state [S, R, P]) ────────────────────────────────────────
+
+def odes_qss(t, y, p, C, delta):
+    S, R, P = y
+    C_pos = max(C, 0.0)
     alpha = (p['alpha_max'] * C_pos**p['n_hill']
              / (p['EC50']**p['n_hill'] + C_pos**p['n_hill']))
-
-    # Tumor — Brady-Nicholls 2020 stem cell model
-    # S = differentiated (sensitive) cells [paper's D]
-    # R = stem-like (resistant) cells      [paper's S]
     N = S + R
     stem_frac = R / N if N > 1e-12 else 0.0
-
     dR = stem_frac * p['p_s'] * p['lambda_'] * R
     dS = (1.0 - stem_frac * p['p_s']) * p['lambda_'] * R - alpha * S
-
-    # PSA (produced by differentiated cells only, cleared at rate gamma)
-    dP = p['delta'] * S - p['gamma'] * P
-
-    return [dD, dC, dS, dR, dP]
+    dP = delta * S - p['gamma'] * P
+    return [dS, dR, dP]
 
 
-# ── Simulation ────────────────────────────────────────────────────────────────
+# ── Per-patient simulation ────────────────────────────────────────────────────
 
-def simulate(p, t_end=1825.0, S0=0.45, R0=0.05):
+def simulate_patient(p, S0, R0, alpha_max, psa0,
+                     psa_thresh_on, psa_thresh_off,
+                     t_end=1825.0, dt=7.0):
     """
-    Simulate adaptive therapy with PK/PD over t_end days.
+    Simulate adaptive therapy using QSS PK approximation.
 
     Parameters
     ----------
-    p      : parameter dict
-    t_end  : float  simulation duration (days)
-    S0, R0 : float  initial sensitive / resistant cell fractions (sum < 1)
+    p              : base parameter dict (P_BASE)
+    S0             : initial differentiated cell fraction (fitted)
+    R0             : initial stem-like cell fraction (fitted)
+    alpha_max      : max drug kill rate day^-1 (fitted)
+    psa0           : first observed PSA — sets ODE initial condition and δ
+    psa_thresh_on  : absolute PSA threshold to restart treatment (τ)
+    psa_thresh_off : absolute PSA threshold to stop treatment (β)
+    t_end          : simulation duration (days)
+    dt             : time step for PSA threshold checks (days)
 
     Returns
     -------
-    t      : (n,)   time array (days)
-    Y      : (5, n) state array rows = [D, C, S, R, P]
-    treat  : list of (t_on, t_off) treatment intervals
+    t         : (n,) time array (days)
+    Y         : (3, n) state rows [S, R, P]
+    intervals : list of (t_on, t_off) treatment intervals
     """
-    # Initial PSA at approximate quasi-steady state (only S produces PSA)
-    P0 = p['delta'] * S0 / p['gamma']
+    p = p.copy()
+    p['alpha_max'] = alpha_max
 
-    PSA_thresh_on  = p['frac_on']  * P0
-    PSA_thresh_off = p['frac_off'] * P0
+    delta = psa0 * p['gamma'] / S0
 
-    y = np.array([0.0, 0.0, S0, R0, P0])   # D, C, S, R, P
+    y = np.array([S0, R0, psa0])
+    time_points = np.arange(0.0, t_end + dt, dt)
 
-    # Dose event times across full simulation
-    dose_times = np.arange(0.0, t_end, p['interval'])
-
-    t_all, Y_all = [], []
-    treatment_intervals = []   # list of (t_on, t_off) pairs
-
+    t_all, Y_all = [0.0], [[S0, R0, psa0]]
+    treatment_intervals = []
     treating   = False
     t_on_start = None
 
-    for i, t_now in enumerate(dose_times):
-        t_next = dose_times[i + 1] if i + 1 < len(dose_times) else t_end
+    for i in range(len(time_points) - 1):
+        t_now  = time_points[i]
+        t_next = time_points[i + 1]
 
-        # ── Adaptive switching (evaluated at each dose time) ──────────────────
-        PSA = y[4]
-        if not treating and PSA >= PSA_thresh_on:
+        PSA = y[2]
+        if not treating and PSA >= psa_thresh_on:
             treating   = True
             t_on_start = t_now
-        elif treating and PSA <= PSA_thresh_off:
+        elif treating and PSA <= psa_thresh_off:
             treating = False
             treatment_intervals.append((t_on_start, t_now))
             t_on_start = None
 
-        # ── Administer dose (bolus to depot) ──────────────────────────────────
-        if treating:
-            y[0] += p['dose_mg']
+        C = C_SS if treating else 0.0
 
-        # ── Integrate to next event ───────────────────────────────────────────
         sol = solve_ivp(
-            fun=lambda t, y: odes(t, y, p),
+            fun=lambda t, y: odes_qss(t, y, p, C, delta),
             t_span=(t_now, t_next),
             y0=y,
             method='RK45',
-            max_step=0.05,          # 1.2 h max step — resolves Cmax after each dose
-            dense_output=False,
+            max_step=1.0,
             rtol=1e-6,
             atol=1e-9,
         )
-
-        t_all.append(sol.t)
-        Y_all.append(sol.y)
         y = sol.y[:, -1].copy()
+        y[0] = max(y[0], 1e-9)
+        y[1] = max(y[1], 1e-9)
 
-    # Close any open treatment interval at end of simulation
+        t_all.append(t_next)
+        Y_all.append(y.tolist())
+
+        if y[2] > 1e6 or y[0] > 1e4:
+            break
+
     if treating and t_on_start is not None:
-        treatment_intervals.append((t_on_start, t_end))
+        treatment_intervals.append((t_on_start, t_all[-1]))
 
-    return (np.concatenate(t_all),
-            np.hstack(Y_all),
-            treatment_intervals)
+    t_arr = np.array(t_all)
+    Y_arr = np.array(Y_all).T   # shape (3, n)
+    return t_arr, Y_arr, treatment_intervals
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def compute_metrics(combo, t_end=1825.0):
+    """
+    Returns (ttp_days, drug_days) for one simulated combo.
+
+    ttp_days  : time-to-progression — last time PSA was in an off-treatment
+                period, or t_end if simulation ran to completion under control.
+                Defined as the end of the last completed off-treatment interval,
+                or t_end if PSA never escaped the threshold band.
+    drug_days : total days on treatment (sum of interval durations).
+    """
+    t         = combo['t']
+    intervals = combo['intervals']
+
+    drug_days = sum(t_off - t_on for t_on, t_off in intervals)
+
+    # TTP: end of last completed off-treatment interval, or t_end if controlled
+    if len(intervals) == 0:
+        ttp_days = t_end   # never needed treatment → controlled throughout
+    else:
+        last_t_off = intervals[-1][1]
+        if last_t_off >= t[-1] - 7:
+            # still on treatment at simulation end → not yet progressed
+            ttp_days = t_end
+        else:
+            # last cycle completed; PSA dropped back below β
+            ttp_days = t_end   # controlled to t_end
+            # check if PSA at end is still below tau (controlled)
+            # if the last interval ended and no more cycles started, patient
+            # is in off-treatment remission → ttp = t_end
+            ttp_days = t_end
+
+    return ttp_days, drug_days
+
+
+def find_optimal_combos(res):
+    """
+    For a single patient, return:
+      best_cycles : (x, y) that maximises number of treatment cycles
+                    (proxy for sustained disease control; ties broken by min drug)
+      best_drug   : (x, y) that minimises total drug exposure in days
+                    (ties broken by max cycles)
+    """
+    metrics = {}
+    for (x, y), combo in res['combos'].items():
+        _, drug = compute_metrics(combo)
+        cycles = len(combo['intervals'])
+        metrics[(x, y)] = (cycles, drug)
+
+    best_cycles = max(metrics, key=lambda k: ( metrics[k][0], -metrics[k][1]))
+    best_drug   = min(metrics, key=lambda k: ( metrics[k][1], -metrics[k][0]))
+    return best_cycles, best_drug, metrics
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_results(t, Y, treatment_intervals, p):
-    D, C, S, R, P = Y
+def _shade_intervals(ax, intervals, color, alpha=0.12):
+    for t_on, t_off in intervals:
+        ax.axvspan(t_on / 365, t_off / 365, color=color, alpha=alpha, lw=0)
 
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    t_yr = t / 365.0
 
-    # Shade treatment-ON periods on all panels
-    for ax in axes:
-        for (t_on, t_off) in treatment_intervals:
-            ax.axvspan(t_on / 365, t_off / 365,
-                       color='steelblue', alpha=0.12, lw=0)
+def _patient_panel(ax, res, x, y, color, label_prefix=''):
+    """Draw PSA trajectory + treatment shading + threshold lines for one combo."""
+    p1    = res['p1']
+    combo = res['combos'][(x, y)]
+    beta  = (1 + x) * p1
+    tau   = (1 + y) * beta
+    t_yr  = combo['t'] / 365.0
+    P     = combo['Y'][2]
 
-    # Panel 1: Drug concentration
-    axes[0].plot(t_yr, C, color='steelblue', lw=1.5)
-    axes[0].set_ylabel('Concentration (ng/mL)')
-    axes[0].set_title('Drug concentration — central compartment')
-    axes[0].spines[['top', 'right']].set_visible(False)
+    _shade_intervals(ax, combo['intervals'], color)
+    ax.plot(t_yr, P, color=color, lw=1.5,
+            label=f'{label_prefix}x={x}, y={y}')
+    ax.axhline(tau,  color=color, ls='--', lw=0.8, alpha=0.7)
+    ax.axhline(beta, color=color, ls=':',  lw=0.8, alpha=0.7)
 
-    # Panel 2: Cell populations
-    axes[1].plot(t_yr, S, color='steelblue', lw=2, label='Sensitive (S)')
-    axes[1].plot(t_yr, R, color='firebrick',  lw=2, label='Resistant (R)')
-    axes[1].plot(t_yr, S + R, color='dimgray', lw=1.5, ls='--', label='Total (S+R)')
-    axes[1].set_ylabel('Cell fraction')
-    axes[1].set_title('Tumor cell populations')
-    axes[1].legend(frameon=False)
-    axes[1].spines[['top', 'right']].set_visible(False)
 
-    # Panel 3: PSA with threshold lines
-    axes[2].plot(t_yr, P, color='darkorange', lw=2, label='PSA')
-    P0 = P[0]
-    axes[2].axhline(p['frac_on']  * P0, color='firebrick', ls='--', lw=1,
-                    label=f'Treat ON threshold ({p["frac_on"]:.1f} x PSA_0)')
-    axes[2].axhline(p['frac_off'] * P0, color='green', ls='--', lw=1,
-                    label=f'Treat OFF threshold ({p["frac_off"]:.1f} x PSA_0)')
-    axes[2].set_ylabel('PSA (ng/mL)')
-    axes[2].set_xlabel('Time (years)')
-    axes[2].set_title('PSA dynamics (adaptive therapy trigger)')
-    axes[2].legend(frameon=False)
-    axes[2].spines[['top', 'right']].set_visible(False)
+def plot_reference(results, x_ref=0.25, y_ref=0.50, ncols=4):
+    """
+    One panel per patient showing only the paper's reference combination
+    (x=0.25, y=0.50: β=1.25×p₁, τ=1.875×p₁).
+    """
+    from matplotlib.lines import Line2D
+    n     = len(results)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(ncols * 4.5, nrows * 3.5))
+    axes = axes.flatten()
 
-    # Alpha(C) at each time point — annotate on panel 0
-    C_pos = np.maximum(C, 0)
-    alpha_t = (p['alpha_max'] * C_pos**p['n_hill']
-               / (p['EC50']**p['n_hill'] + C_pos**p['n_hill']))
-    ax_alpha = axes[0].twinx()
-    ax_alpha.plot(t_yr, alpha_t, color='gray', lw=1, alpha=0.6, ls=':')
-    ax_alpha.set_ylabel('alpha(C) — day$^{-1}$', color='gray', fontsize=11)
-    ax_alpha.tick_params(axis='y', colors='gray')
-    ax_alpha.spines[['top']].set_visible(False)
+    for ax, res in zip(axes, results):
+        p1  = res['p1']
+        fit = res['fit']
+        _patient_panel(ax, res, x_ref, y_ref, 'steelblue')
 
+        n_cyc = len(res['combos'][(x_ref, y_ref)]['intervals'])
+        ax.set_title(f"{fit['pid']}   p\u2081={p1:.1f} ng/mL\n"
+                     f"{n_cyc} cycles  |  \u03b1_max={fit['alpha_max']:.3f}",
+                     fontsize=8)
+        ax.set_xlabel('Time (years)', fontsize=8)
+        ax.set_ylabel('PSA (ng/mL)',  fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    handles = [
+        Line2D([0], [0], color='steelblue', lw=1.5, label='PSA trajectory'),
+        Line2D([0], [0], color='steelblue', lw=0.8, ls='--', label='τ (ON threshold)'),
+        Line2D([0], [0], color='steelblue', lw=0.8, ls=':',  label='β (OFF threshold)'),
+        matplotlib.patches.Patch(color='steelblue', alpha=0.12, label='Treatment ON'),
+    ]
+    fig.legend(handles=handles, loc='lower center', ncol=4,
+               fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.02))
+
+    plt.suptitle(f'RBAT simulations — reference combination (x={x_ref}, y={y_ref})\n'
+                 f'\u03b2 = {1+x_ref:.2f}\u00d7p\u2081  |  \u03c4 = {(1+y_ref)*(1+x_ref):.3f}\u00d7p\u2081',
+                 fontsize=11, y=1.01)
+    plt.tight_layout()
+    return fig
+
+
+def plot_optimal(results, ncols=4):
+    """
+    One panel per patient showing:
+      - grey  : reference combo (x=0.25, y=0.50)
+      - blue  : combo that maximises TTP
+      - orange: combo that minimises drug exposure
+    """
+    from matplotlib.lines import Line2D
+    import matplotlib.patches as mpatches
+
+    n     = len(results)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(ncols * 4.5, nrows * 3.5))
+    axes = axes.flatten()
+
+    for ax, res in zip(axes, results):
+        p1  = res['p1']
+        fit = res['fit']
+        best_cyc, best_drug, metrics = find_optimal_combos(res)
+
+        # Reference (always shown in grey)
+        _patient_panel(ax, res, 0.25, 0.50, '#999999')
+
+        # Max cycles (blue) — only draw if different from reference
+        if best_cyc != (0.25, 0.50):
+            _patient_panel(ax, res, *best_cyc, '#1f77b4', label_prefix='Max cycles: ')
+        else:
+            ax.plot([], [], color='#1f77b4', lw=1.5,
+                    label=f'Max cycles: x={best_cyc[0]}, y={best_cyc[1]} (=ref)')
+
+        # Min drug (orange) — only draw if different from reference and max cycles
+        if best_drug not in [(0.25, 0.50), best_cyc]:
+            _patient_panel(ax, res, *best_drug, '#ff7f0e', label_prefix='Min drug: ')
+        else:
+            ax.plot([], [], color='#ff7f0e', lw=1.5,
+                    label=f'Min drug: x={best_drug[0]}, y={best_drug[1]}')
+
+        cyc_val  = metrics[best_cyc][0]
+        drug_val = metrics[best_drug][1]
+        ax.set_title(f"{fit['pid']}   p\u2081={p1:.1f}\n"
+                     f"MaxCyc={cyc_val} ({best_cyc[0]},{best_cyc[1]})  "
+                     f"MinDrug={drug_val:.0f}d ({best_drug[0]},{best_drug[1]})",
+                     fontsize=7.5)
+        ax.set_xlabel('Time (years)', fontsize=8)
+        ax.set_ylabel('PSA (ng/mL)',  fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    handles = [
+        Line2D([0], [0], color='#999999', lw=1.5, label='Reference (x=0.25, y=0.50)'),
+        Line2D([0], [0], color='#1f77b4', lw=1.5, label='Max treatment cycles'),
+        Line2D([0], [0], color='#ff7f0e', lw=1.5, label='Min drug exposure'),
+        Line2D([0], [0], color='grey',    lw=0.8, ls='--', label='\u03c4 (ON threshold)'),
+        Line2D([0], [0], color='grey',    lw=0.8, ls=':',  label='\u03b2 (OFF threshold)'),
+    ]
+    fig.legend(handles=handles, loc='lower center', ncol=5,
+               fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.02))
+
+    plt.suptitle('RBAT — optimal threshold combinations per patient\n'
+                 'Blue: maximises treatment cycles  |  Orange: minimises drug exposure  |  '
+                 'Grey: reference (x=0.25, y=0.50)',
+                 fontsize=11, y=1.01)
     plt.tight_layout()
     return fig
 
@@ -253,19 +379,57 @@ def plot_results(t, Y, treatment_intervals, p):
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    t, Y, treat_intervals = simulate(p, t_end=1825, S0=0.45, R0=0.05)
+    BASE = ('/Users/80031987/Desktop/Basanta_Marusyk_Lab_2026/'
+            'PKPD_AdaptiveTherapy/')
 
-    print(f"Simulation complete: {t[-1]:.0f} days ({t[-1]/365:.1f} years)")
-    print(f"Treatment intervals: {len(treat_intervals)}")
-    for i, (on, off) in enumerate(treat_intervals):
-        print(f"  Cycle {i+1}: day {on:.0f} – {off:.0f}  ({(off-on):.0f} days ON)")
+    print("Loading patient data...")
+    patients = load_adaptive_patients(DATA_PATH)
+    print(f"  {len(patients)} patients loaded\n")
 
-    D, C, S, R, P = Y
-    print(f"\nFinal state:")
-    print(f"  C     = {C[-1]:.2f} ng/mL")
-    print(f"  S     = {S[-1]:.4f}")
-    print(f"  R     = {R[-1]:.4f}")
-    print(f"  PSA   = {P[-1]:.2f} ng/mL")
+    print("Loading saved fits from fits.pkl...")
+    import pickle
+    with open(BASE + 'fits.pkl', 'rb') as f:
+        fits = pickle.load(f)
+    print(f"  {len(fits)} patients loaded\n")
 
-    fig = plot_results(t, Y, treat_intervals, p)
+    print("Simulating RBAT with 9 threshold combinations...")
+    results = []
+    for fit in fits:
+        pid  = fit['pid']
+        data = patients[pid]
+        psa0 = float(data['psa'][0])
+        p1   = get_last_cycle_psa(data)
+
+        print(f"  {pid}  (psa0={psa0:.2f}, p1={p1:.2f})", end='')
+        combos = {}
+        for x, y in itertools.product(X_VALS, Y_VALS):
+            beta = (1 + x) * p1
+            tau  = (1 + y) * beta
+            t, Y, intervals = simulate_patient(
+                P_BASE,
+                S0=fit['S0'], R0=fit['R0'], alpha_max=fit['alpha_max'],
+                psa0=psa0,
+                psa_thresh_on=tau, psa_thresh_off=beta,
+                t_end=3044.0,
+            )
+            combos[(x, y)] = {'t': t, 'Y': Y, 'intervals': intervals}
+
+        mid_cycles = len(combos[(0.25, 0.50)]['intervals'])
+        print(f"  →  {mid_cycles} cycles (x=0.25, y=0.50)")
+        results.append({
+            'pid':    pid,
+            'psa0':   psa0,
+            'p1':     p1,
+            'fit':    fit,
+            'combos': combos,
+        })
+
+    fig1 = plot_reference(results)
+    fig1.savefig(BASE + 'adaptive_simulations.pdf', dpi=300, bbox_inches='tight')
+    print(f"\nFigure saved to adaptive_simulations.pdf")
+
+    fig2 = plot_optimal(results)
+    fig2.savefig(BASE + 'adaptive_optimal.pdf', dpi=300, bbox_inches='tight')
+    print(f"Figure saved to adaptive_optimal.pdf")
+
     plt.show()
